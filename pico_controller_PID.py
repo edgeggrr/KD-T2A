@@ -1,14 +1,26 @@
 #!/usr/bin/env python3
 
-"""Position-hold PID controller for the Swift Pico.
+"""Safety-first position-hold PID controller for the Swift Pico.
 
-Publishes /drone_command and /pos_error, reads the marker from /whycode_node/markers,
-and accepts live gain updates on /pitch_pid, /roll_pid and /throttle_pid.
+Publishes /drone_command and /pos_error, reads /whycode_node/markers and
+accepts live gain updates on /pitch_pid, /roll_pid and /throttle_pid.
+
+WhyCode frame in this simulation (top-down MuJoCo camera):
+    x = world +x
+    y = world -y
+    z = distance below the camera (smaller z = higher altitude)
+
+The horizontal sign conventions depend on the camera/body mounting.  These
+defaults match what was observed in the simulator: positive pitch/roll
+commands move the drone toward the WhyCode setpoint.  The axis assignment and
+signs are ROS parameters so they can be flipped without editing this file.
 """
 
+import math
 import time
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from std_msgs.msg import Header
 
@@ -18,53 +30,136 @@ from swift_msgs.msg import SwiftMsgs
 from whycode_interfaces.msg import MarkerArray
 
 
+BASE_RC = 1500.0
+
+
+def _clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def _slew(current, target, max_step):
+    """Move `current` toward `target` by at most `max_step`."""
+    if target > current:
+        return min(target, current + max_step)
+    return max(target, current - max_step)
+
+
 class Swift_Pico(Node):
     def __init__(self):
         super().__init__('pico_controller')
 
-        # Position is [x, y, z] in WhyCode units; z is measured from the camera.
+        # ---------------------------------------------------------------
+        # Configuration (all overridable through ROS parameters)
+        # ---------------------------------------------------------------
+        self.desired_state = [float(v) for v in self.declare_parameter(
+            'desired_state', [1.0, -1.0, 13.0]).value]
+
+        # WhyCode z thresholds.  z decreases as the drone climbs.  x/y
+        # authority ramps from 0 (z >= airborne_z_start) to 1 (z <= airborne_z_full).
+        self.airborne_z_start = float(self.declare_parameter(
+            'airborne_z_start', 14.6).value)
+        self.airborne_z_full = float(self.declare_parameter(
+            'airborne_z_full', 14.2).value)
+
+        self.marker_timeout = float(self.declare_parameter(
+            'marker_timeout', 0.5).value)
+        self.loop_rate = float(self.declare_parameter('loop_rate', 30.0).value)
+        self.loop_period = 1.0 / max(self.loop_rate, 1.0)
+
+        # The RC -> attitude interface maps +/-85 RC counts to +/-4.5 deg.
+        # Keep a much tighter cap than that: +/-60 counts is about +/-3.2 deg,
+        # which is plenty for gentle position control and leaves margin before
+        # the attitude controller saturates.
+        self.max_tilt = float(self.declare_parameter(
+            'max_tilt_counts', 60.0).value)
+        # Keep throttle close to hover.  1570 is only ~70 counts (about 2 N)
+        # above the 1500 hover value, so the drone cannot "shoot up".
+        self.throttle_min = int(self.declare_parameter(
+            'throttle_min', 1430).value)
+        self.throttle_max = int(self.declare_parameter(
+            'throttle_max', 1570).value)
+        self.hover_throttle = float(self.declare_parameter(
+            'hover_throttle', 1500).value)
+        # z decreases as the drone climbs.  If it gets this far above the
+        # setpoint, force a gentle descent instead of letting it run away.
+        self.altitude_ceiling_margin = float(self.declare_parameter(
+            'altitude_ceiling_margin', 0.4).value)
+
+        # Command slew-rate limits (RC counts per control tick).
+        self.max_tilt_step = float(self.declare_parameter(
+            'max_tilt_step', 5.0).value)
+        self.max_throttle_step = float(self.declare_parameter(
+            'max_throttle_step', 15.0).value)
+
+        self.integral_limit = float(self.declare_parameter(
+            'integral_limit', 3.0).value)
+        self.pos_tau = float(self.declare_parameter(
+            'position_filter_tau', 0.05).value)
+        self.vel_tau = float(self.declare_parameter(
+            'velocity_filter_tau', 0.08).value)
+
+        # Axis mapping / signs.  Flight test showed that the drone moved away
+        # from the setpoint with negative signs, so the defaults are positive.
+        # If an axis still runs away, flip that sign or swap x_axis/y_axis
+        # instead of changing the PID code.
+        self.x_axis = str(self.declare_parameter('x_axis', 'pitch').value).lower()
+        self.y_axis = str(self.declare_parameter('y_axis', 'roll').value).lower()
+        if {self.x_axis, self.y_axis} != {'pitch', 'roll'}:
+            raise ValueError("x_axis and y_axis must be 'pitch' and 'roll'")
+
+        self.pitch_sign = float(self.declare_parameter('pitch_sign', 1.0).value)
+        self.roll_sign = float(self.declare_parameter('roll_sign', 1.0).value)
+        self.throttle_sign = float(self.declare_parameter(
+            'throttle_sign', -1.0).value)
+
+        # Gentle defaults.  The tuner overrides these when it publishes.
+        self.gains = {
+            'pitch': self._read_gains('pitch_gains', [25.0, 1.5, 45.0]),
+            'roll': self._read_gains('roll_gains', [25.0, 1.5, 45.0]),
+            'throttle': self._read_gains('throttle_gains', [20.070, 6.688, 61.200]),
+        }
+
+        # ---------------------------------------------------------------
+        # State
+        # ---------------------------------------------------------------
         self.current_state = [0.0, 0.0, 0.0]
-        self.desired_state = [1.5, -1.5, 13.0]
         self.filtered_state = None
         self.velocity = [0.0, 0.0, 0.0]
-        self.prev_error = [0.0, 0.0, 0.0]
-        self.derivative = [0.0, 0.0, 0.0]
         self.error_sum = [0.0, 0.0, 0.0]
-        self.last_output = [0.0, 0.0, 0.0]
         self.last_marker_time = 0.0
-        self.have_error = False
+        self.last_pid_time = 0.0
 
-        # Gains are ordered [pitch/x, roll/y, throttle/z] and are the tuned final values.
-        self.Kp = [60.0, 60.0, 50.0]
-        self.Ki = [4.0, 4.0, 10.0]
-        self.Kd = [150.0, 150.0, 115.0]
-
-        self.max_values = [2000, 2000, 2000]
-        self.min_values = [1000, 1000, 1000]
-        self.sum_limit = 3.0
-        self.pos_alpha = 0.4
-        self.deriv_alpha = 0.2
-        self.airborne_z = 14.6
-
-        self.sample_time = 0.033
+        self.command_roll = BASE_RC
+        self.command_pitch = BASE_RC
+        self.command_throttle = self.hover_throttle
 
         self.cmd = SwiftMsgs()
-        self.cmd.rc_roll = 1500
-        self.cmd.rc_pitch = 1500
-        self.cmd.rc_yaw = 1500
-        self.cmd.rc_throttle = 1500
+        self.cmd.rc_roll = int(BASE_RC)
+        self.cmd.rc_pitch = int(BASE_RC)
+        self.cmd.rc_yaw = int(BASE_RC)
+        self.cmd.rc_throttle = int(self.hover_throttle)
         self.cmd.rc_aux4 = 2000
 
         self.pos_error = Error()
 
+        # ---------------------------------------------------------------
+        # ROS interfaces
+        # ---------------------------------------------------------------
         self.command_pub = self.create_publisher(SwiftMsgs, '/drone_command', 10)
         self.pos_error_pub = self.create_publisher(Error, '/pos_error', 10)
         self.heartbeat_pub = self.create_publisher(Header, '/controller_heartbeat', 10)
 
-        self.create_subscription(MarkerArray, '/whycode_node/markers', self.whycode_callback, 1)
+        self.create_subscription(
+            MarkerArray, '/whycode_node/markers', self.whycode_callback, 1)
         self.create_subscription(PIDTune, '/pitch_pid', self.pitch_set_pid, 1)
         self.create_subscription(PIDTune, '/roll_pid', self.roll_set_pid, 1)
         self.create_subscription(PIDTune, '/throttle_pid', self.altitude_set_pid, 1)
+
+        self.get_logger().info(
+            'PID controller ready: x->%s, y->%s, signs pitch=%.0f roll=%.0f '
+            'throttle=%.0f, max tilt=%.0f counts' % (
+                self.x_axis, self.y_axis, self.pitch_sign,
+                self.roll_sign, self.throttle_sign, self.max_tilt))
 
         self.publish_heartbeat()
         self.create_timer(0.1, self.publish_heartbeat)
@@ -72,9 +167,32 @@ class Swift_Pico(Node):
         time.sleep(0.5)
         self.arm()
 
-        self.create_timer(self.sample_time, self.pid)
+        self.create_timer(self.loop_period, self.pid)
 
+    # -------------------------------------------------------------------
+    # Parameters / gains
+    # -------------------------------------------------------------------
+    def _read_gains(self, name, default):
+        values = list(self.declare_parameter(name, default).value)
+        if len(values) != 3:
+            raise ValueError('%s must contain [Kp, Ki, Kd]' % name)
+        return [float(v) for v in values]
+
+    def pitch_set_pid(self, tune):
+        self.gains['pitch'] = [float(tune.kp), float(tune.ki), float(tune.kd)]
+
+    def roll_set_pid(self, tune):
+        self.gains['roll'] = [float(tune.kp), float(tune.ki), float(tune.kd)]
+
+    def altitude_set_pid(self, tune):
+        self.gains['throttle'] = [float(tune.kp), float(tune.ki), float(tune.kd)]
+
+    # -------------------------------------------------------------------
+    # Heartbeat / arming
+    # -------------------------------------------------------------------
     def publish_heartbeat(self):
+        if not rclpy.ok():
+            return
         hb = Header()
         hb.stamp = self.get_clock().now().to_msg()
         hb.frame_id = 'pico_controller_active'
@@ -90,105 +208,167 @@ class Swift_Pico(Node):
 
     def arm(self):
         self.disarm()
-        self.cmd.rc_roll = 1500
-        self.cmd.rc_yaw = 1500
-        self.cmd.rc_pitch = 1500
-        self.cmd.rc_throttle = 1500
+        self.cmd.rc_roll = int(BASE_RC)
+        self.cmd.rc_yaw = int(BASE_RC)
+        self.cmd.rc_pitch = int(BASE_RC)
+        self.cmd.rc_throttle = int(self.hover_throttle)
         self.cmd.rc_aux4 = 2000
         self.command_pub.publish(self.cmd)
 
+    # -------------------------------------------------------------------
+    # Sensor callback
+    # -------------------------------------------------------------------
     def whycode_callback(self, msg):
         if not msg.markers:
             return
+
         position = msg.markers[0].position.position
-        self.current_state[0] = position.x
-        self.current_state[1] = position.y
-        self.current_state[2] = position.z
-        self.last_marker_time = time.monotonic()
-
-    def pitch_set_pid(self, tune):
-        self.Kp[0] = tune.kp
-        self.Ki[0] = tune.ki
-        self.Kd[0] = tune.kd
-
-    def roll_set_pid(self, tune):
-        self.Kp[1] = tune.kp
-        self.Ki[1] = tune.ki
-        self.Kd[1] = tune.kd
-
-    def altitude_set_pid(self, tune):
-        self.Kp[2] = tune.kp
-        self.Ki[2] = tune.ki
-        self.Kd[2] = tune.kd
-
-    def pid(self):
-        now = time.monotonic()
-        if self.last_marker_time == 0.0 or now - self.last_marker_time > 0.5:
-            self.error_sum = [0.0, 0.0, 0.0]
-            self.derivative = [0.0, 0.0, 0.0]
-            self.filtered_state = None
-            self.have_error = False
-            self.hold_neutral()
+        pos = [float(position.x), float(position.y), float(position.z)]
+        if not all(math.isfinite(v) for v in pos):
             return
 
-        # Low-pass the marker and derive a damped velocity estimate.
-        if self.filtered_state is None:
-            self.filtered_state = list(self.current_state)
-        for i in range(3):
-            self.filtered_state[i] += self.pos_alpha * (
-                self.current_state[i] - self.filtered_state[i])
+        now = time.monotonic()
 
-        error = [0.0, 0.0, 0.0]
-        raw_derivative = [0.0, 0.0, 0.0]
-        for i in range(3):
-            error[i] = self.desired_state[i] - self.filtered_state[i]
-            if self.have_error:
-                raw_derivative[i] = (error[i] - self.prev_error[i]) / self.sample_time
-                self.derivative[i] += self.deriv_alpha * (
-                    raw_derivative[i] - self.derivative[i])
-        self.have_error = True
+        # First sample after startup / marker loss: seed the filter.
+        if self.filtered_state is None or self.last_marker_time == 0.0:
+            self.current_state = list(pos)
+            self.filtered_state = list(pos)
+            self.velocity = [0.0, 0.0, 0.0]
+            self.last_marker_time = now
+            return
 
+        dt = now - self.last_marker_time
+        if dt <= 1e-6:
+            return
+        dt = min(dt, 0.5)
+
+        # Time-based low-pass filters, so they behave the same at any marker rate.
+        alpha_pos = 1.0 - math.exp(-dt / max(self.pos_tau, 1e-3))
+        alpha_vel = 1.0 - math.exp(-dt / max(self.vel_tau, 1e-3))
+
+        for i in range(3):
+            raw_velocity = (pos[i] - self.current_state[i]) / dt
+            self.velocity[i] += alpha_vel * (raw_velocity - self.velocity[i])
+            self.filtered_state[i] += alpha_pos * (pos[i] - self.filtered_state[i])
+
+        self.current_state = list(pos)
+        self.last_marker_time = now
+
+    # -------------------------------------------------------------------
+    # Control
+    # -------------------------------------------------------------------
+    def pid(self):
+        if not rclpy.ok():
+            return
+        now = time.monotonic()
+
+        if self.last_marker_time == 0.0 or \
+                (now - self.last_marker_time) > self.marker_timeout:
+            self.reset_control()
+            self.publish_targets(BASE_RC, BASE_RC, self.hover_throttle)
+            return
+
+        if self.last_pid_time == 0.0:
+            dt = self.loop_period
+        else:
+            dt = _clamp(now - self.last_pid_time, 1e-3, 0.2)
+        self.last_pid_time = now
+
+        z = self.filtered_state[2]
+
+        # Smoothly enable horizontal control as the drone clears the floor.
+        span = self.airborne_z_start - self.airborne_z_full
+        if span <= 1e-6:
+            gate = 1.0 if z <= self.airborne_z_start else 0.0
+        else:
+            gate = (self.airborne_z_start - z) / span
+        gate = _clamp(gate, 0.0, 1.0)
+
+        axis_for_index = (self.x_axis, self.y_axis, 'throttle')
+        error = [self.desired_state[i] - self.filtered_state[i] for i in range(3)]
         output = [0.0, 0.0, 0.0]
+
         for i in range(3):
-            if abs(self.last_output[i]) < 400.0 or error[i] * self.last_output[i] < 0.0:
-                self.error_sum[i] += error[i] * self.sample_time
-            self.error_sum[i] = max(-self.sum_limit, min(self.sum_limit, self.error_sum[i]))
-            output[i] = (self.Kp[i] * error[i]
-                         + self.Ki[i] * self.error_sum[i]
-                         + self.Kd[i] * self.derivative[i])
-            self.prev_error[i] = error[i]
-            self.last_output[i] = output[i]
+            kp, ki, kd = self.gains[axis_for_index[i]]
+            is_horizontal = i < 2
 
-        # Hold x/y until the drone has cleared the floor, then blend into full control.
-        if self.filtered_state[2] > self.airborne_z:
-            output[0] = 0.0
-            output[1] = 0.0
+            u = kp * error[i] + ki * self.error_sum[i] - kd * self.velocity[i]
 
-        self.cmd.rc_pitch = self.clamp(1500.0 + output[0], 0)
-        self.cmd.rc_roll = self.clamp(1500.0 + output[1], 1)
-        self.cmd.rc_throttle = self.clamp(1500.0 - output[2], 2)
-        self.cmd.rc_yaw = 1500
+            integrate = True
+            if is_horizontal:
+                if gate <= 0.0:
+                    integrate = False
+                elif u >= self.max_tilt and error[i] > 0.0:
+                    integrate = False
+                elif u <= -self.max_tilt and error[i] < 0.0:
+                    integrate = False
+            else:
+                throttle_preview = self.hover_throttle + self.throttle_sign * u
+                rate_sign = self.throttle_sign * error[i]
+                if throttle_preview >= self.throttle_max and rate_sign > 0.0:
+                    integrate = False
+                elif throttle_preview <= self.throttle_min and rate_sign < 0.0:
+                    integrate = False
 
-        self.publish_command()
-        self.pos_error.pitch_error = float(error[0])
-        self.pos_error.roll_error = float(error[1])
+            if integrate:
+                self.error_sum[i] += error[i] * dt * (gate if is_horizontal else 1.0)
+                self.error_sum[i] = _clamp(
+                    self.error_sum[i], -self.integral_limit, self.integral_limit)
+
+            u = kp * error[i] + ki * self.error_sum[i] - kd * self.velocity[i]
+
+            if is_horizontal:
+                u = _clamp(gate * u, -self.max_tilt, self.max_tilt)
+            output[i] = u
+
+        pitch_input = output[0] if self.x_axis == 'pitch' else output[1]
+        roll_input = output[0] if self.x_axis == 'roll' else output[1]
+
+        pitch_target = BASE_RC + self.pitch_sign * pitch_input
+        roll_target = BASE_RC + self.roll_sign * roll_input
+        throttle_target = self.hover_throttle + self.throttle_sign * output[2]
+
+        # Hard altitude backstop: if the drone is clearly above the setpoint,
+        # command a gentle descent even if the PID/integrator is saturated.
+        if z < (self.desired_state[2] - self.altitude_ceiling_margin):
+            throttle_target = self.throttle_min
+            self.error_sum[2] = min(self.error_sum[2], 0.0)
+
+        self.publish_targets(roll_target, pitch_target, throttle_target)
+
+        self.pos_error.pitch_error = float(
+            error[0] if self.x_axis == 'pitch' else error[1])
+        self.pos_error.roll_error = float(
+            error[0] if self.x_axis == 'roll' else error[1])
         self.pos_error.throttle_error = float(error[2])
         self.pos_error.yaw_error = 0.0
         self.pos_error_pub.publish(self.pos_error)
 
-    def clamp(self, value, axis):
-        return int(max(self.min_values[axis], min(self.max_values[axis], value)))
+    def reset_control(self):
+        self.error_sum = [0.0, 0.0, 0.0]
+        self.velocity = [0.0, 0.0, 0.0]
+        self.filtered_state = None
+        self.last_pid_time = 0.0
 
-    def publish_command(self):
-        self.command_pub.publish(self.cmd)
+    def publish_targets(self, roll, pitch, throttle):
+        """Clamp, slew-limit and publish the three commands."""
+        if not rclpy.ok():
+            return
+        roll = _clamp(roll, BASE_RC - self.max_tilt, BASE_RC + self.max_tilt)
+        pitch = _clamp(pitch, BASE_RC - self.max_tilt, BASE_RC + self.max_tilt)
+        throttle = _clamp(throttle, self.throttle_min, self.throttle_max)
 
-    def hold_neutral(self):
-        self.cmd.rc_roll = 1500
-        self.cmd.rc_pitch = 1500
-        self.cmd.rc_throttle = 1500
-        self.cmd.rc_yaw = 1500
+        self.command_roll = _slew(self.command_roll, roll, self.max_tilt_step)
+        self.command_pitch = _slew(self.command_pitch, pitch, self.max_tilt_step)
+        self.command_throttle = _slew(
+            self.command_throttle, throttle, self.max_throttle_step)
+
+        self.cmd.rc_roll = int(round(self.command_roll))
+        self.cmd.rc_pitch = int(round(self.command_pitch))
+        self.cmd.rc_throttle = int(round(self.command_throttle))
+        self.cmd.rc_yaw = int(BASE_RC)
         self.cmd.rc_aux4 = 2000
-        self.publish_command()
+        self.command_pub.publish(self.cmd)
 
 
 def main(args=None):
@@ -197,11 +377,12 @@ def main(args=None):
 
     try:
         rclpy.spin(swift_pico)
-    except KeyboardInterrupt:
-        swift_pico.get_logger().info('KeyboardInterrupt, shutting down.\n')
+    except (KeyboardInterrupt, ExternalShutdownException):
+        swift_pico.get_logger().info('Shutting down.\n')
     finally:
         swift_pico.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
