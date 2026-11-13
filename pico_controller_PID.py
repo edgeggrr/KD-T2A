@@ -52,7 +52,7 @@ class Swift_Pico(Node):
         # Configuration (all overridable through ROS parameters)
         # ---------------------------------------------------------------
         self.desired_state = [float(v) for v in self.declare_parameter(
-            'desired_state', [1.0, -1.0, 13.0]).value]
+            'desired_state', [1.5, -1.5, 13.0]).value]
 
         # WhyCode z thresholds.  z decreases as the drone climbs.  x/y
         # authority ramps from 0 (z >= airborne_z_start) to 1 (z <= airborne_z_full).
@@ -72,18 +72,19 @@ class Swift_Pico(Node):
         # the attitude controller saturates.
         self.max_tilt = float(self.declare_parameter(
             'max_tilt_counts', 60.0).value)
-        # Keep throttle close to hover.  1570 is only ~70 counts (about 2 N)
-        # above the 1500 hover value, so the drone cannot "shoot up".
+        # Altitude authority.  +/-100 counts around hover is about +/-3 N,
+        # enough to climb/brake hard without letting the drone shoot away.
         self.throttle_min = int(self.declare_parameter(
-            'throttle_min', 1430).value)
+            'throttle_min', 1400).value)
         self.throttle_max = int(self.declare_parameter(
-            'throttle_max', 1570).value)
+            'throttle_max', 1600).value)
         self.hover_throttle = float(self.declare_parameter(
             'hover_throttle', 1500).value)
-        # z decreases as the drone climbs.  If it gets this far above the
-        # setpoint, force a gentle descent instead of letting it run away.
+        # z decreases as the drone climbs.  Only step in for a real runaway:
+        # at 0.4 this backstop fires inside the +/-0.4 scoring band and turns
+        # small altitude drift into a slow bang-bang limit cycle.
         self.altitude_ceiling_margin = float(self.declare_parameter(
-            'altitude_ceiling_margin', 0.4).value)
+            'altitude_ceiling_margin', 0.8).value)
 
         # Command slew-rate limits (RC counts per control tick).
         self.max_tilt_step = float(self.declare_parameter(
@@ -116,7 +117,7 @@ class Swift_Pico(Node):
         self.gains = {
             'pitch': self._read_gains('pitch_gains', [25.0, 1.5, 45.0]),
             'roll': self._read_gains('roll_gains', [25.0, 1.5, 45.0]),
-            'throttle': self._read_gains('throttle_gains', [20.070, 6.688, 61.200]),
+            'throttle': self._read_gains('throttle_gains', [45.0, 6.0, 90.0]),
         }
 
         # ---------------------------------------------------------------
@@ -164,7 +165,13 @@ class Swift_Pico(Node):
         self.publish_heartbeat()
         self.create_timer(0.1, self.publish_heartbeat)
 
-        time.sleep(0.5)
+        # Wait for the first marker before arming.  Arming while the camera is
+        # still locking on lets the drone drift open-loop, which changes the
+        # climb distance from run to run and makes the tune irreproducible.
+        deadline = time.monotonic() + 8.0
+        while rclpy.ok() and self.last_marker_time == 0.0 and \
+                time.monotonic() < deadline:
+            rclpy.spin_once(self, timeout_sec=0.05)
         self.arm()
 
         self.create_timer(self.loop_period, self.pid)
